@@ -1,5 +1,6 @@
 """Test message tool suppress logic for final replies."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,13 +27,16 @@ class TestMessageToolSuppressLogic:
     async def test_suppress_when_sent_to_same_target(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(
-            id="call1", name="message",
+            id="call1",
+            name="message",
             arguments={"content": "Hello", "channel": "feishu", "chat_id": "chat123"},
         )
-        calls = iter([
-            LLMResponse(content="", tool_calls=[tool_call]),
-            LLMResponse(content="Done", tool_calls=[]),
-        ])
+        calls = iter(
+            [
+                LLMResponse(content="", tool_calls=[tool_call]),
+                LLMResponse(content="Done", tool_calls=[]),
+            ]
+        )
         loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
@@ -51,13 +55,20 @@ class TestMessageToolSuppressLogic:
     async def test_not_suppress_when_sent_to_different_target(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(
-            id="call1", name="message",
-            arguments={"content": "Email content", "channel": "email", "chat_id": "user@example.com"},
+            id="call1",
+            name="message",
+            arguments={
+                "content": "Email content",
+                "channel": "email",
+                "chat_id": "user@example.com",
+            },
         )
-        calls = iter([
-            LLMResponse(content="", tool_calls=[tool_call]),
-            LLMResponse(content="I've sent the email.", tool_calls=[]),
-        ])
+        calls = iter(
+            [
+                LLMResponse(content="", tool_calls=[tool_call]),
+                LLMResponse(content="I've sent the email.", tool_calls=[]),
+            ]
+        )
         loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
@@ -66,7 +77,9 @@ class TestMessageToolSuppressLogic:
         if isinstance(mt, MessageTool):
             mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
 
-        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send email")
+        msg = InboundMessage(
+            channel="feishu", sender_id="user1", chat_id="chat123", content="Send email"
+        )
         result = await loop._process_message(msg)
 
         assert len(sent) == 1
@@ -77,7 +90,9 @@ class TestMessageToolSuppressLogic:
     @pytest.mark.asyncio
     async def test_not_suppress_when_no_message_tool_used(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
-        loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Hello!", tool_calls=[]))
+        loop.provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(content="Hello!", tool_calls=[])
+        )
         loop.tools.get_definitions = MagicMock(return_value=[])
 
         msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Hi")
@@ -89,15 +104,17 @@ class TestMessageToolSuppressLogic:
     async def test_progress_hides_internal_reasoning(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
-        calls = iter([
-            LLMResponse(
-                content="Visible<think>hidden</think>",
-                tool_calls=[tool_call],
-                reasoning_content="secret reasoning",
-                thinking_blocks=[{"signature": "sig", "thought": "secret thought"}],
-            ),
-            LLMResponse(content="Done", tool_calls=[]),
-        ])
+        calls = iter(
+            [
+                LLMResponse(
+                    content="Visible<think>hidden</think>",
+                    tool_calls=[tool_call],
+                    reasoning_content="secret reasoning",
+                    thinking_blocks=[{"signature": "sig", "thought": "secret thought"}],
+                ),
+                LLMResponse(content="Done", tool_calls=[]),
+            ]
+        )
         loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
         loop.tools.execute = AsyncMock(return_value="ok")
@@ -117,16 +134,77 @@ class TestMessageToolSuppressLogic:
 
 
 class TestMessageToolTurnTracking:
+    @pytest.mark.asyncio
+    async def test_default_context_isolated_across_concurrent_tasks(self) -> None:
+        sent: list[OutboundMessage] = []
+        tool = MessageTool(send_callback=AsyncMock(side_effect=lambda msg: sent.append(msg)))
+        allow_first_send = asyncio.Event()
+        second_ready = asyncio.Event()
 
-    def test_sent_in_turn_tracks_same_target(self) -> None:
+        async def first_turn() -> str:
+            tool.set_context("feishu", "chat1", "msg1")
+            tool.start_turn()
+            allow_first_send.set()
+            await second_ready.wait()
+            return await tool.execute("hello")
+
+        async def second_turn() -> None:
+            await allow_first_send.wait()
+            tool.set_context("telegram", "chat2", "msg2")
+            tool.start_turn()
+            second_ready.set()
+
+        result, _ = await asyncio.gather(first_turn(), second_turn())
+
+        assert result == "Message sent to feishu:chat1"
+        assert len(sent) == 1
+        assert sent[0].channel == "feishu"
+        assert sent[0].chat_id == "chat1"
+        assert sent[0].metadata["message_id"] == "msg1"
+
+    @pytest.mark.asyncio
+    async def test_sent_targets_isolated_across_concurrent_tasks(self) -> None:
+        sent: list[OutboundMessage] = []
+        send_started = asyncio.Event()
+        allow_send_finish = asyncio.Event()
+        second_ready = asyncio.Event()
+
+        async def send_callback(msg: OutboundMessage) -> None:
+            sent.append(msg)
+            send_started.set()
+            await allow_send_finish.wait()
+
+        tool = MessageTool(send_callback=AsyncMock(side_effect=send_callback))
+
+        async def first_turn() -> list[tuple[str, str]]:
+            tool.set_context("feishu", "chat1")
+            tool.start_turn()
+            await tool.execute("hello", channel="feishu", chat_id="chat1")
+            return tool.get_turn_sends()
+
+        async def second_turn() -> None:
+            await send_started.wait()
+            tool.set_context("feishu", "chat2")
+            tool.start_turn()
+            second_ready.set()
+
+        first_task = asyncio.create_task(first_turn())
+        second_task = asyncio.create_task(second_turn())
+        await second_ready.wait()
+        allow_send_finish.set()
+        sent_targets = await first_task
+        await second_task
+
+        assert len(sent) == 1
+        assert sent[0].chat_id == "chat1"
+        assert sent_targets == [("feishu", "chat1")]
+
+    @pytest.mark.asyncio
+    async def test_start_turn_resets_sent_targets(self) -> None:
         tool = MessageTool()
         tool.set_context("feishu", "chat1")
-        assert not tool._sent_in_turn
-        tool._sent_in_turn = True
-        assert tool._sent_in_turn
-
-    def test_start_turn_resets(self) -> None:
-        tool = MessageTool()
-        tool._sent_in_turn = True
+        tool.set_send_callback(AsyncMock())
+        await tool.execute("hello")
+        assert tool.get_turn_sends() == [("feishu", "chat1")]
         tool.start_turn()
-        assert not tool._sent_in_turn
+        assert tool.get_turn_sends() == []
